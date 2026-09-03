@@ -1,0 +1,15 @@
+.env
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-*
+.coverage
+htmlcov/
+.DS_Store
+.worktrees/
+.superpowers/sdd/
+dist/
+build/
+*.egg-info/

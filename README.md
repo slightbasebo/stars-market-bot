@@ -49,7 +49,8 @@ python3 -m venv .venv
 .venv/bin/python -m stars_market_bot.app
 ```
 
-Health check: `curl http://127.0.0.1:8080/health`.
+The HTTP health endpoint is available only in webhook mode. In the default
+polling mode, check the systemd service and logs as shown below.
 
 ## Production layout
 

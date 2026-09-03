@@ -1,0 +1,31 @@
+[Unit]
+Description=Telegram Stars Market Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stars-market-bot
+Group=stars-market-bot
+WorkingDirectory=/opt/stars-market-bot
+EnvironmentFile=/etc/stars-market-bot.env
+Environment=DELIVERY_MODE=polling
+Environment=OWNER_WALLET_ADDRESS=UQCsFwdmQK_F5uA_5Zf7FrSjhxedNCrOpgbT8hiaR2eFu-vI
+Environment=OWNER_TELEGRAM_ID=8670053970
+Environment=DATABASE_PATH=/var/lib/stars-market-bot/bot.sqlite3
+Environment=FRAGMENT_API_URL=https://api-stars.duckdns.org
+Environment=TONCENTER_API_URL=https://toncenter.com/api/v3
+Environment=SCAN_INTERVAL_SECONDS=5
+Environment=INVOICE_TTL_SECONDS=900
+ExecStart=/opt/stars-market-bot/.venv/bin/python -m stars_market_bot.app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/stars-market-bot
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

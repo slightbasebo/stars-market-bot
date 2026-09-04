@@ -5,6 +5,7 @@ from aiogram.methods import SendRichMessage
 
 from stars_market_bot.app import (
     AppContext,
+    configure_bot_commands,
     run_expiry_cycle,
     run_payment_cycle,
     run_purchase_cycle,
@@ -52,6 +53,32 @@ class FakeFragment:
 
     async def status(self, purchase_id):
         return FragmentPurchase(purchase_id, "completed", "chain-hash")
+
+
+def test_bot_commands_expose_start_in_every_supported_language():
+    class CommandBot:
+        def __init__(self):
+            self.calls = []
+
+        async def set_my_commands(self, commands, *, language_code=None):
+            self.calls.append((commands, language_code))
+
+    async def scenario():
+        bot = CommandBot()
+        await configure_bot_commands(bot)
+        return bot.calls
+
+    calls = asyncio.run(scenario())
+
+    assert [language_code for _, language_code in calls] == [None, "ru", "en", "uk", "tr"]
+    assert all([command.command for command in commands] == ["start"] for commands, _ in calls)
+    assert [commands[0].description for commands, _ in calls] == [
+        "Open the store",
+        "Открыть магазин",
+        "Open the store",
+        "Відкрити магазин",
+        "Mağazayı aç",
+    ]
 
 
 async def prepared_context(tmp_path, *, expires_at=None):

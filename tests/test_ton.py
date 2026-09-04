@@ -112,6 +112,29 @@ def test_gram_conversion_accepts_only_final_inbound_transfer():
     assert candidates[0].comment == "SM-GRAM"
 
 
+@pytest.mark.parametrize("value", [None, "0"])
+def test_gram_conversion_ignores_external_messages_without_value(value):
+    payload = {
+        "transactions": [
+            {
+                "hash": "external-wallet-command",
+                "lt": "100",
+                "now": int(NOW.timestamp()),
+                "finality": "finalized",
+                "description": {"aborted": False},
+                "in_msg": {
+                    "destination": V4_ADDRESS,
+                    "value": value,
+                    "bounced": False,
+                    "message_content": {"body": comment_boc("not-a-payment")},
+                },
+            }
+        ]
+    }
+
+    assert parse_gram_transactions(payload, V4_ADDRESS) == []
+
+
 def test_gram_conversion_accepts_current_finality_and_fully_credited_uninit_wallet():
     payload = {
         "transactions": [
@@ -246,6 +269,40 @@ def test_scanner_matches_reference_through_repository_and_advances_cursor(tmp_pa
             assert saved.state is OrderState.PAID
             assert saved.payment_hash == "valid-gram"
             assert (cursor.logical_time, cursor.tx_hash) == (101, "valid-gram")
+            replay = await scanner.scan_once(now=NOW + timedelta(minutes=3))
+            assert replay.matched == replay.unmatched == 0
+        finally:
+            await repo.close()
+
+    asyncio.run(scenario())
+
+
+def test_expired_invoice_payment_is_still_detected_without_starting_purchase(tmp_path):
+    async def scenario():
+        repo = await Repository.open(tmp_path / "bot.sqlite3")
+        await repo.setup()
+        try:
+            order = await repo.create_order(
+                user_id=1001, product=Product.STARS, recipient="recipient",
+                product_amount=50, months=None, asset=Asset.GRAM,
+                quoted_api_units=1_000_000_000, idempotency_key="late-order", created_at=NOW,
+            )
+            invoice = Invoice(V4_ADDRESS, Asset.GRAM, 1_100_000_000, "SM-LATE", NOW, NOW + timedelta(minutes=15))
+            assert await repo.set_invoice(order.id, invoice)
+            assert await repo.expire_order(order.id, now=NOW + timedelta(minutes=16))
+            from stars_market_bot.domain import PaymentCandidate
+            payment = PaymentCandidate(
+                tx_hash="late-payment", logical_time=101, destination=V4_ADDRESS,
+                asset=Asset.GRAM, units=invoice.units, comment=invoice.reference,
+                timestamp=NOW + timedelta(minutes=16), finalized=True, aborted=False, bounced=False,
+            )
+            scanner = PaymentScanner(repo, FakeTonClient([payment]), V4_ADDRESS)
+            result = await scanner.scan_once(now=NOW + timedelta(minutes=17))
+            assert result.unmatched == 1
+            assert result.matched == 0
+            assert await repo.has_payment(payment.tx_hash)
+            assert (await repo.get_order(order.id)).state is OrderState.EXPIRED
+            assert await repo.claim_paid_order() is None
         finally:
             await repo.close()
 

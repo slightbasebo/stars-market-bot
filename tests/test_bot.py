@@ -1,6 +1,9 @@
 import asyncio
 from datetime import datetime, timezone
 
+import pytest
+
+from stars_market_bot import bot as bot_module
 from stars_market_bot.bot import (
     all_callback_samples,
     confirmation_screen,
@@ -13,6 +16,16 @@ from stars_market_bot.bot import (
 )
 from stars_market_bot.domain import Asset, Invoice, Product
 from stars_market_bot.texts import Language, TEXTS, text
+
+
+@pytest.mark.parametrize("asset", list(Asset))
+@pytest.mark.parametrize("amount", ["10", "100", "20.5", "0.000001", "1"])
+def test_displayed_payment_amount_preserves_its_value(asset, amount):
+    from decimal import Decimal
+    from stars_market_bot.domain import ASSET_DECIMALS
+
+    units = int(Decimal(amount) * 10 ** ASSET_DECIMALS[asset])
+    assert Decimal(bot_module._display_units(units, asset)) == Decimal(amount)
 
 
 def test_every_language_has_the_same_complete_keys():
@@ -120,3 +133,32 @@ def test_usdt_is_disabled_when_balance_check_fails():
         raise RuntimeError("TON Center is unavailable")
 
     assert asyncio.run(payment_asset_ready(Asset.USDT, broken_check)) is False
+
+
+def test_checkout_preflight_runs_availability_and_quote_concurrently():
+    class ConcurrentFragment:
+        def __init__(self):
+            self.check_started = asyncio.Event()
+            self.quote_started = asyncio.Event()
+
+        async def check(self, product, username, amount, asset):
+            self.check_started.set()
+            await asyncio.wait_for(self.quote_started.wait(), timeout=0.2)
+            return "available"
+
+        async def quote(self, product, amount):
+            self.quote_started.set()
+            await asyncio.wait_for(self.check_started.wait(), timeout=0.2)
+            return "quote"
+
+    async def scenario():
+        fragment = ConcurrentFragment()
+        return await bot_module.fetch_checkout(
+            fragment,
+            Product.STARS,
+            "alice_1",
+            50,
+            Asset.GRAM,
+        )
+
+    assert asyncio.run(scenario()) == ("available", "quote")

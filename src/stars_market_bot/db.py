@@ -834,6 +834,22 @@ class Repository:
             ).fetchall()
             return [self._order_from_row(row) for row in rows]
 
+    async def payment_scan_starts(self) -> dict[Asset, datetime]:
+        async with self._lock:
+            self._require_open()
+            rows = self._connection.execute(
+                "SELECT asset, MIN(invoice_created_at) AS start FROM orders "
+                "WHERE invoice_created_at IS NOT NULL GROUP BY asset"
+            ).fetchall()
+            return {Asset(row["asset"]): datetime.fromisoformat(row["start"]) for row in rows}
+
+    async def has_payment(self, tx_hash: str) -> bool:
+        async with self._lock:
+            self._require_open()
+            return self._connection.execute(
+                "SELECT 1 FROM payments WHERE tx_hash = ?", (tx_hash,)
+            ).fetchone() is not None
+
     async def list_purchase_orders(
         self,
         *,

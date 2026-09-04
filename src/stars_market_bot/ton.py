@@ -176,6 +176,9 @@ def parse_gram_transactions(
         destination = inbound.get("destination")
         if destination is None or _raw_address(destination) != owner_raw:
             continue
+        value = inbound.get("value")
+        if value is None or value == "0":
+            continue
         if not _is_finalized(transaction.get("finality")):
             continue
         description = _mapping(transaction.get("description"), "description")
@@ -189,7 +192,7 @@ def parse_gram_transactions(
                 logical_time=_decimal_int(transaction.get("lt"), "lt"),
                 destination=owner_wallet,
                 asset=Asset.GRAM,
-                units=_decimal_int(inbound.get("value"), "value", positive=True),
+                units=_decimal_int(value, "value", positive=True),
                 comment=parse_plain_comment(content.get("body")),
                 timestamp=_timestamp(transaction.get("now")),
                 finalized=True,
@@ -376,36 +379,34 @@ class PaymentScanner:
         self._repo = repo
         self._client = client
         self._owner_wallet = owner_wallet
+        self._scan_lock = asyncio.Lock()
 
     async def scan_once(self, *, now: datetime | None = None) -> ScanResult:
-        current_time = now or datetime.now(timezone.utc)
-        orders = await self._repo.list_scannable_orders(now=current_time)
-        if not orders:
+        async with self._scan_lock:
+            return await self._scan_once()
+
+    async def _scan_once(self) -> ScanResult:
+        starts = await self._repo.payment_scan_starts()
+        if not starts:
             return ScanResult()
-        start_utime = min(
-            int(order.invoice_created_at.timestamp())
-            for order in orders
-            if order.invoice_created_at is not None
-        )
-        assets = {order.asset for order in orders}
         batches: list[tuple[str, ScanBatch]] = []
-        if Asset.GRAM in assets:
+        if Asset.GRAM in starts:
             cursor = await self._repo.get_scanner_cursor("gram")
             batches.append(
                 (
                     "gram",
                     await self._client.scan_gram(
-                        self._owner_wallet, start_utime, cursor
+                        self._owner_wallet, int(starts[Asset.GRAM].timestamp()), cursor
                     ),
                 )
             )
-        if Asset.USDT in assets:
+        if Asset.USDT in starts:
             cursor = await self._repo.get_scanner_cursor("usdt")
             batches.append(
                 (
                     "usdt",
                     await self._client.scan_usdt(
-                        self._owner_wallet, start_utime, cursor
+                        self._owner_wallet, int(starts[Asset.USDT].timestamp()), cursor
                     ),
                 )
             )
@@ -413,6 +414,8 @@ class PaymentScanner:
         seen = matched = unmatched = 0
         for stream_key, batch in batches:
             for candidate in batch.candidates:
+                if await self._repo.has_payment(candidate.tx_hash):
+                    continue
                 seen += 1
                 order = None
                 if candidate.comment:

@@ -1,8 +1,11 @@
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import escape
+import logging
 import secrets
+from urllib.parse import quote
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
@@ -31,6 +34,9 @@ from .texts import Language, text
 from .ui import CUSTOM_EMOJI, CopyControl, Metric, Screen, show_screen
 
 
+log = logging.getLogger(__name__)
+
+
 class PurchaseFlow(StatesGroup):
     amount = State()
     recipient = State()
@@ -48,6 +54,20 @@ async def payment_asset_ready(
         return await check_usdt_ready()
     except Exception:
         return False
+
+
+async def fetch_checkout(
+    fragment: FragmentClient,
+    product: Product,
+    recipient: str,
+    amount: int,
+    asset: Asset,
+):
+    availability, quote = await asyncio.gather(
+        fragment.check(product, recipient, amount, asset),
+        fragment.quote(product, amount),
+    )
+    return availability, quote
 
 
 def _button(
@@ -125,8 +145,10 @@ def all_callback_samples() -> tuple[str, ...]:
 
 
 def _display_units(units: int, asset: Asset) -> str:
-    value = Decimal(units) / (Decimal(10) ** ASSET_DECIMALS[asset])
-    return format(value, "f").rstrip("0").rstrip(".") or "0"
+    decimals = ASSET_DECIMALS[asset]
+    whole, fraction = divmod(units, 10 ** decimals)
+    fractional_text = f"{fraction:0{decimals}d}".rstrip("0")
+    return f"{whole}.{fractional_text}" if fractional_text else str(whole)
 
 
 def home_screen(language: Language) -> Screen:
@@ -180,7 +202,7 @@ def invoice_screen(
         emoji="payment",
         metrics=(
             Metric(text(language, "payment_label"), f"{price} {invoice.asset.value.upper()}"),
-            Metric(text(language, "expires_label"), text(language, "expires_value")),
+            Metric(text(language, "expires_label"), invoice.expires_at.strftime("%H:%M UTC")),
         ),
         details=(
             text(language, "invoice_title", order_id=order_id),
@@ -228,7 +250,53 @@ def _order_status(language: Language, order: OrderRecord) -> str:
         return text(language, "failed", order_id=order.id)
     if order.state in {OrderState.PAID, OrderState.PURCHASING}:
         return text(language, "payment_found")
+    if order.state is OrderState.RECONCILIATION_REQUIRED:
+        return text(language, "manual_review", order_id=order.id)
     return text(language, "payment_waiting")
+
+
+def order_screen(language: Language, order: OrderRecord) -> Screen:
+    completed = order.state is OrderState.COMPLETED
+    amount = order.product_amount or order.months or 0
+    return Screen(
+        title=(text(language, "completed_title", order_id=order.id) if completed
+               else f'{text(language, "order_label")} #{order.id}'),
+        lead=(text(language, "completed_lead") if completed
+              else _order_status(language, order)),
+        emoji="success" if completed else "orders",
+        metrics=(
+            Metric(text(language, "product_label"), _product_text(language, order.product, amount)),
+            Metric(text(language, "recipient_label"), f"@{order.recipient}"),
+            Metric(text(language, "payment_label"),
+                   f"{_display_units(order.customer_units or 0, order.asset)} {order.asset.value.upper()}"),
+        ),
+        items=(text(language, "api_promo"),) if completed else (),
+        details=(text(language, "transaction_label"),
+                 f"{order.final_transaction_hash or '—'}\n{order.fragment_purchase_id or '—'}") if completed else None,
+        copy_controls=(
+            CopyControl(text(language, "copy_order"), str(order.id)),
+            *((CopyControl(text(language, "copy_transaction"), order.final_transaction_hash),)
+              if order.final_transaction_hash else ()),
+            *((CopyControl(text(language, "copy_purchase"), order.fragment_purchase_id),)
+              if order.fragment_purchase_id else ()),
+        ),
+    )
+
+
+def order_keyboard(language: Language, order: OrderRecord) -> InlineKeyboardMarkup:
+    rows = []
+    if order.state is OrderState.AWAITING_PAYMENT and order.invoice:
+        rows.append([InlineKeyboardButton(text=text(language, "open_wallet"),
+                                          url=build_payment_link(order.invoice))])
+        rows.append([_button(text(language, "check_payment"), f"check:{order.id}", "confirm", "primary")])
+    if order.final_transaction_hash:
+        rows.append([InlineKeyboardButton(
+            text=text(language, "transaction_label"),
+            url="https://tonviewer.com/transaction/" + quote(order.final_transaction_hash, safe=""),
+        )])
+    rows.append([_button(text(language, "my_orders"), "menu:orders", "orders")])
+    rows.append([_button(text(language, "back"), "cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_router(
@@ -436,7 +504,13 @@ def build_router(
             product = Product(data["product"])
             amount = int(data["amount"])
             recipient = str(data["recipient"])
-            check = await fragment.check(product, recipient, amount, asset)
+            check, quote = await fetch_checkout(
+                fragment,
+                product,
+                recipient,
+                amount,
+                asset,
+            )
             if not check.available:
                 await _screen(
                     callback,
@@ -449,11 +523,16 @@ def build_router(
                 )
                 await state.clear()
                 return
-            quote = await fragment.quote(product, amount)
             api_amount = quote.prices.gram if asset is Asset.GRAM else quote.prices.usdt
             api_money = quote_customer_amount(api_amount, Decimal("0"), asset)
             customer = quote_customer_amount(api_amount, settings.commission_percent, asset)
-        except (FragmentTemporaryError, FragmentPermanentError, KeyError, ValueError):
+        except (FragmentTemporaryError, FragmentPermanentError, KeyError, ValueError) as error:
+            log.warning(
+                "checkout_preflight_failed user_id=%s error=%s code=%s",
+                callback.from_user.id,
+                type(error).__name__,
+                getattr(error, "code", None),
+            )
             await _screen(
                 callback,
                 Screen(
@@ -508,6 +587,7 @@ def build_router(
             if not await repo.set_invoice(order.id, invoice):
                 raise RuntimeError("invoice state changed")
         except Exception:
+            log.exception("invoice_creation_failed user_id=%s", callback.from_user.id)
             await _screen(
                 callback,
                 Screen(
@@ -548,6 +628,7 @@ def build_router(
                 await request_scan()
                 order = await repo.get_order(order_id, user_id=callback.from_user.id)
         except Exception:
+            log.exception("payment_check_failed user_id=%s", callback.from_user.id)
             await callback.answer(text(language, "service_error"), show_alert=True)
             return
         await callback.answer(_order_status(language, order), show_alert=True)
@@ -578,8 +659,30 @@ def build_router(
                 emoji="orders",
                 items=items,
             ),
-            main_menu_keyboard(language),
+            InlineKeyboardMarkup(inline_keyboard=[
+                [_button(f'#{item.id} · {text(language, f"state_{item.state.value}")}', f"order:{item.id}")]
+                for item in values
+            ] + [[_button(text(language, "back"), "cancel")]]),
         )
+
+    @router.callback_query(F.data.startswith("order:"))
+    async def open_order(callback: CallbackQuery) -> None:
+        language = await _language(repo, callback.from_user.id)
+        try:
+            order_id = int(callback.data.split(":", 1)[1])
+            order = await repo.get_order(order_id, user_id=callback.from_user.id)
+        except ValueError:
+            order = None
+        if order is None:
+            await callback.answer(text(language, "no_orders"), show_alert=True)
+            return
+        await repo.expire_order(order.id, now=datetime.now(timezone.utc))
+        order = await repo.get_order(order.id, user_id=callback.from_user.id)
+        screen = (invoice_screen(language, order_id=order.id,
+                                 price=_display_units(order.customer_units, order.asset),
+                                 invoice=order.invoice)
+                  if order.state is OrderState.AWAITING_PAYMENT else order_screen(language, order))
+        await _screen(callback, screen, order_keyboard(language, order))
 
     @router.callback_query(F.data == "menu:api")
     async def api_promo(callback: CallbackQuery) -> None:
@@ -599,5 +702,53 @@ def build_router(
         language = await _language(repo, callback.from_user.id)
         await state.clear()
         await _screen(callback, home_screen(language), main_menu_keyboard(language))
+
+    @router.callback_query()
+    async def recover_stale_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        language = await _language(repo, callback.from_user.id)
+        log.warning(
+            "stale_callback_recovered user_id=%s callback=%s",
+            callback.from_user.id,
+            (callback.data or "").split(":", 1)[0],
+        )
+        await state.clear()
+        await _screen(
+            callback,
+            Screen(
+                title=text(language, "welcome"),
+                lead=text(language, "stale_action"),
+                emoji="hello",
+                banner="home.png",
+            ),
+            main_menu_keyboard(language),
+        )
+
+    @router.message()
+    async def recover_unexpected_message(message: Message, state: FSMContext) -> None:
+        saved = await repo.get_language(message.from_user.id)
+        log.warning("unexpected_message_recovered user_id=%s", message.from_user.id)
+        await state.clear()
+        if saved is None:
+            await _screen(
+                message,
+                Screen(
+                    title=text(Language.EN, "choose_language"),
+                    lead=text(Language.EN, "welcome"),
+                    emoji="language",
+                ),
+                language_keyboard(),
+            )
+            return
+        language = Language(saved)
+        await _screen(
+            message,
+            Screen(
+                title=text(language, "welcome"),
+                lead=text(language, "stale_action"),
+                emoji="hello",
+                banner="home.png",
+            ),
+            main_menu_keyboard(language),
+        )
 
     return router

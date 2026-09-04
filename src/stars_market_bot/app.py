@@ -14,22 +14,40 @@ from aiohttp import ClientSession, web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import FSInputFile, Update
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from aiogram.types import BotCommand, FSInputFile, Update
 from fragment_api import FragmentAPI
 
-from .bot import build_router
+from .bot import build_router, order_keyboard, order_screen
 from .config import Settings, load_env_file
 from .db import OrderRecord, Repository
 from .domain import Asset, OrderState, Product, quote_customer_amount
 from .fragment import FragmentClient, FragmentPermanentError, FragmentTemporaryError
 from .texts import Language, text
 from .ton import PaymentScanner, TonCenterClient, validate_owner_wallet
-from .ui import CopyControl, Metric, Screen, send_screen
+from .ui import Screen, send_screen
 
 
 log = logging.getLogger("stars_market_bot")
 MIN_USDT_GAS_BALANCE = 1_000_000_000
+
+
+async def configure_bot_commands(bot: Bot) -> None:
+    for language_code, description in (
+        (None, "Open the store"),
+        ("ru", "Открыть магазин"),
+        ("en", "Open the store"),
+        ("uk", "Відкрити магазин"),
+        ("tr", "Mağazayı aç"),
+    ):
+        try:
+            await bot.set_my_commands(
+                [BotCommand(command="start", description=description)],
+                language_code=language_code,
+            )
+        except Exception as error:
+            log.warning("bot_commands_setup_failed language=%s error=%s",
+                        language_code, type(error).__name__)
 
 
 @dataclass
@@ -52,9 +70,9 @@ async def _safe_notify(context: AppContext, chat_id: int, body: str) -> None:
         log.warning("notification_failed chat=%s", chat_id)
 
 
-async def _safe_notify_screen(context: AppContext, chat_id: int, screen: Screen) -> None:
+async def _safe_notify_screen(context: AppContext, chat_id: int, screen: Screen, keyboard=None) -> None:
     try:
-        await send_screen(context.bot, chat_id, screen)
+        await send_screen(context.bot, chat_id, screen, keyboard)
     except Exception:
         log.warning("notification_failed chat=%s", chat_id)
 
@@ -159,35 +177,12 @@ async def _process_purchase(context: AppContext, order: OrderRecord) -> None:
         ):
             return
         language = await _user_language(context, order.user_id)
-        transaction_hash = result.transaction_hash or "—"
+        order = await context.repo.get_order(order.id)
         await _safe_notify_screen(
             context,
             order.user_id,
-            Screen(
-                title=text(language, "completed_title", order_id=order.id),
-                lead=text(language, "completed_lead"),
-                emoji="success",
-                metrics=(
-                    Metric(
-                        text(language, "product_label"),
-                        text(language, order.product.value, amount=amount),
-                    ),
-                    Metric(text(language, "recipient_label"), f"@{order.recipient}"),
-                ),
-                items=(text(language, "api_promo"),),
-                details=(
-                    text(language, "transaction_label"),
-                    f"{transaction_hash}\n{order.fragment_purchase_id or '—'}",
-                ),
-                copy_controls=(
-                    CopyControl(text(language, "copy_transaction"), transaction_hash),
-                    CopyControl(text(language, "copy_order"), str(order.id)),
-                    CopyControl(
-                        text(language, "copy_purchase"),
-                        order.fragment_purchase_id or "—",
-                    ),
-                ),
-            ),
+            order_screen(language, order),
+            order_keyboard(language, order),
         )
     elif result.error_code == "TOP_UP_REQUIRED":
         if not await context.repo.finish_order(
@@ -313,7 +308,7 @@ def create_app(settings: Settings) -> web.Application:
         async def usdt_ready():
             return await ton_client.account_balance(owner_wallet) >= MIN_USDT_GAS_BALANCE
 
-        dispatcher = Dispatcher(storage=MemoryStorage())
+        dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
         dispatcher.include_router(build_router(
             repo,
             fragment,
@@ -324,6 +319,7 @@ def create_app(settings: Settings) -> web.Application:
         context = AppContext(settings, repo, fragment, scanner, bot)
         application["context"] = context
         application["dispatcher"] = dispatcher
+        await configure_bot_commands(bot)
         await bot.set_webhook(
             settings.public_base_url + settings.webhook_path,
             secret_token=settings.webhook_secret,
@@ -386,7 +382,7 @@ async def run_polling(settings: Settings) -> None:
     async def usdt_ready():
         return await ton_client.account_balance(owner_wallet) >= MIN_USDT_GAS_BALANCE
 
-    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dispatcher.include_router(build_router(
         repo,
         fragment,
@@ -402,6 +398,7 @@ async def run_polling(settings: Settings) -> None:
     ]
     try:
         await bot.delete_webhook(drop_pending_updates=False)
+        await configure_bot_commands(bot)
         await dispatcher.start_polling(
             bot,
             allowed_updates=dispatcher.resolve_used_update_types(),

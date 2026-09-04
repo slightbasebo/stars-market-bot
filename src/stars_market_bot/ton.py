@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import time
 from typing import Any, Mapping
 
+from aiohttp import ClientError, ClientTimeout
+
 from pytoniq import Address, Cell, WalletV4R2, WalletV5R1
 from pytoniq.contract.wallets.wallet import WALLET_V4_R2_CODE
 from pytoniq.contract.wallets.wallet_v5 import WALLET_V5_R1_CODE
@@ -42,6 +44,12 @@ class ScanResult:
     seen: int = 0
     matched: int = 0
     unmatched: int = 0
+
+
+class TonCenterTemporaryError(RuntimeError):
+    def __init__(self, retry_after: float):
+        super().__init__("TON Center is temporarily unavailable")
+        self.retry_after = retry_after
 
 
 def _address(value: object) -> Address:
@@ -262,9 +270,13 @@ class TonCenterClient:
         self._minimum_interval = 0.0 if api_key else 1.0
         self._request_lock = asyncio.Lock()
         self._last_request = 0.0
+        self._retry_at = 0.0
+        self._backoff = 0.0
 
     async def _get(self, path: str, params: Mapping[str, object]) -> Mapping[str, Any]:
         async with self._request_lock:
+            if time.monotonic() < self._retry_at:
+                raise TonCenterTemporaryError(self._retry_at - time.monotonic())
             delay = self._minimum_interval - (time.monotonic() - self._last_request)
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -273,9 +285,21 @@ class TonCenterClient:
                     f"{self._base_url}{path}",
                     params=params,
                     headers=self._headers,
+                    timeout=ClientTimeout(total=15),
                 ) as response:
+                    if response.status == 429 or response.status >= 500:
+                        retry_after = response.headers.get("Retry-After", "0")
+                        seconds = int(retry_after) if retry_after.isdigit() else 0
+                        self._backoff = min(60, max(5, seconds, self._backoff * 2))
+                        self._retry_at = time.monotonic() + self._backoff
+                        raise TonCenterTemporaryError(self._backoff)
                     response.raise_for_status()
                     payload = await response.json()
+                    self._backoff = 0.0
+            except (ClientError, TimeoutError):
+                self._backoff = min(60, max(5, self._backoff * 2))
+                self._retry_at = time.monotonic() + self._backoff
+                raise TonCenterTemporaryError(self._backoff) from None
             finally:
                 self._last_request = time.monotonic()
         return _mapping(payload, "response")
@@ -324,7 +348,17 @@ class TonCenterClient:
         payload = await self._get("/transactions", params)
         candidates = parse_gram_transactions(payload, owner_wallet)
         candidates = _after_cursor(candidates, cursor)
-        return _batch(candidates)
+        batch = _batch(candidates)
+        markers = [
+            (_decimal_int(row.get("lt"), "lt"), row["hash"])
+            for row in _rows(payload, "transactions")
+            if _is_finalized(row.get("finality")) and isinstance(row.get("hash"), str)
+        ]
+        if markers:
+            logical_time, tx_hash = max(markers)
+            if cursor is None or (logical_time, tx_hash) > (cursor.logical_time, cursor.tx_hash):
+                return ScanBatch(batch.candidates, logical_time, tx_hash)
+        return batch
 
     async def scan_usdt(
         self,

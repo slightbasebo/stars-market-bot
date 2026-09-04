@@ -24,7 +24,7 @@ from .db import OrderRecord, Repository
 from .domain import Asset, OrderState, Product, quote_customer_amount
 from .fragment import FragmentClient, FragmentPermanentError, FragmentTemporaryError
 from .texts import Language, text
-from .ton import PaymentScanner, TonCenterClient, validate_owner_wallet
+from .ton import PaymentScanner, TonCenterClient, TonCenterTemporaryError, validate_owner_wallet
 from .ui import Screen, send_screen
 
 
@@ -258,13 +258,17 @@ async def run_payment_cycle(context: AppContext) -> int:
 
 async def _worker(context: AppContext, function, interval: int) -> None:
     while True:
+        delay = interval
         try:
             await function(context)
         except asyncio.CancelledError:
             raise
+        except TonCenterTemporaryError as error:
+            delay = max(interval, error.retry_after)
+            log.warning("payment_provider_retry delay_seconds=%.1f", delay)
         except Exception:
             log.exception("worker_cycle_failed")
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
 
 
 def create_app(settings: Settings) -> web.Application:

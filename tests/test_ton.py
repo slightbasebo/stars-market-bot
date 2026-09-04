@@ -17,6 +17,7 @@ from stars_market_bot.ton import (
     PaymentScanner,
     ScanBatch,
     TonCenterClient,
+    TonCenterTemporaryError,
     derive_wallet_addresses,
     parse_gram_transactions,
     parse_plain_comment,
@@ -32,6 +33,54 @@ MNEMONIC = (
 V4_ADDRESS = "UQC_kDKawGkRsTEEdpL6pwiGJKWomVSx2Cn1s8H1SzSsXjUy"
 V5_ADDRESS = "UQCRFY2ZCWj8PowktL5p689EgnwDSqNBpv_OTx9nmzUajLu_"
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
+
+
+def test_rate_limit_delays_requests_then_recovers(monkeypatch):
+    from stars_market_bot import ton
+
+    clock = [100.0]
+    monkeypatch.setattr(ton.time, "monotonic", lambda: clock[0])
+
+    class Response:
+        def __init__(self, status):
+            self.status = status
+            self.headers = {"Retry-After": "12"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        def raise_for_status(self):
+            assert self.status == 200
+
+        async def json(self):
+            return {"accounts": [{"balance": "1000000000"}]}
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            assert kwargs["timeout"].total == 15
+            return Response(429 if self.calls == 1 else 200)
+
+    async def scenario():
+        session = Session()
+        client = TonCenterClient(session, "https://toncenter.com/api/v3")
+        with pytest.raises(TonCenterTemporaryError) as failed:
+            await client.account_balance(V4_ADDRESS)
+        assert failed.value.retry_after == 12
+        with pytest.raises(TonCenterTemporaryError):
+            await client.account_balance(V4_ADDRESS)
+        assert session.calls == 1
+        clock[0] += 13
+        assert await client.account_balance(V4_ADDRESS) == 1_000_000_000
+        assert session.calls == 2
+
+    asyncio.run(scenario())
 
 
 def comment_boc(value: str, *, opcode: int = 0) -> str:
@@ -71,6 +120,21 @@ def test_plain_comment_requires_zero_opcode_and_valid_utf8():
     assert parse_plain_comment(comment_boc("SM-ABC123")) == "SM-ABC123"
     assert parse_plain_comment(comment_boc("encrypted", opcode=0x2167DA4B)) is None
     assert parse_plain_comment("not-base64") is None
+
+
+def test_scanner_advances_past_finalized_non_payment_transactions():
+    client = object.__new__(TonCenterClient)
+
+    async def get(path, params):
+        return {"transactions": [{
+            "hash": "wallet-command", "lt": "200", "finality": "finalized",
+            "in_msg": {"destination": V4_ADDRESS, "value": None},
+        }]}
+
+    client._get = get
+    batch = asyncio.run(client.scan_gram(V4_ADDRESS, int(NOW.timestamp()), None))
+    assert batch.candidates == ()
+    assert (batch.logical_time, batch.tx_hash) == (200, "wallet-command")
 
 
 def test_gram_conversion_accepts_only_final_inbound_transfer():
